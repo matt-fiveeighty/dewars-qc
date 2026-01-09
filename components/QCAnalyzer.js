@@ -204,8 +204,19 @@ const QCAnalyzer = () => {
         
         const weight = severityWeight[check.severity] || 1;
         totalWeight += weight;
-        if (check.status === 'pass' || manualChecks[check.id]) {
-          weightedScore += weight;
+        
+        // For user-activated checks: checkbox activates it, but they still need status='pass' to count as passing
+        // For regular checks: status='pass' OR manual checkbox means it passes
+        if (check.isUserActivated) {
+          // User activated this check - only passes if status is 'pass'
+          if (check.status === 'pass') {
+            weightedScore += weight;
+          }
+        } else {
+          // Regular check - passes if status='pass' or manually checked
+          if (check.status === 'pass' || manualChecks[check.id]) {
+            weightedScore += weight;
+          }
         }
       });
     });
@@ -227,8 +238,17 @@ const QCAnalyzer = () => {
         if (check.isAwardCheck) return;
         // Skip user-activated checks unless the user has checked them
         if (check.isUserActivated && !manualChecks[check.id]) return;
-        if (check.severity === 'REQUIRED' && check.status !== 'pass' && !manualChecks[check.id]) {
-          count++;
+        
+        // For user-activated: count as "to address" if activated but not passing
+        // For regular: count if not pass and not manually checked
+        if (check.isUserActivated) {
+          if (check.severity === 'REQUIRED' && check.status !== 'pass') {
+            count++;
+          }
+        } else {
+          if (check.severity === 'REQUIRED' && check.status !== 'pass' && !manualChecks[check.id]) {
+            count++;
+          }
         }
       });
     });
@@ -528,6 +548,12 @@ const QCAnalyzer = () => {
     setAnalysisProgress('Re-analyzing with your adjusted regions...');
     
     try {
+      // Store the current regions and manual checks BEFORE re-analysis
+      const preservedRegions = { ...evaluationRegions };
+      const preservedLogoBox = logoClearSpaceBox ? { ...logoClearSpaceBox } : null;
+      const preservedSHeight = sHeightValue;
+      const preservedManualChecks = { ...manualChecks };
+      
       // Collect all manually adjusted regions to send to AI
       const manualRegions = {};
       Object.entries(evaluationRegions).forEach(([id, region]) => {
@@ -554,8 +580,8 @@ const QCAnalyzer = () => {
           height: imageData.height,
           format: detectedFormat,
           visualType,
-          manualRegions, // Send the manually adjusted regions
-          preserveRegions: true // Flag to tell API to use these regions
+          manualRegions,
+          preserveRegions: true
         })
       });
 
@@ -567,12 +593,7 @@ const QCAnalyzer = () => {
 
       const ai = data.analysis;
       
-      // Store the current regions BEFORE updating
-      const preservedRegions = { ...evaluationRegions };
-      const preservedLogoBox = logoClearSpaceBox ? { ...logoClearSpaceBox } : null;
-      const preservedSHeight = sHeightValue;
-      
-      // Update AI analysis
+      // Update AI analysis state
       setAiAnalysis(ai);
       setCriticalIssues(ai.criticalIssues || []);
       setRecommendations(ai.recommendations || []);
@@ -581,10 +602,12 @@ const QCAnalyzer = () => {
       setPendingReanalyze([]);
       setAnalysisProgress('Building results...');
       
-      // Rebuild results but DON'T let AI override our manual regions
+      // Calculate values using PRESERVED manual regions
       const bottleThreshold = getBottleScaleThreshold(detectedFormat, visualType);
       const shortestSide = Math.min(imageData.width, imageData.height);
       const longestSide = Math.max(imageData.width, imageData.height);
+      const frameBorder5pct = Math.round(shortestSide * 0.05);
+      const format = detectedFormat;
       
       // Use preserved region values for calculations
       const safeZoneRegion = preservedRegions['safe-zone'];
@@ -604,51 +627,540 @@ const QCAnalyzer = () => {
         ? (isLandscape ? (logoPositionRegion.x + logoPositionRegion.width / 2) >= 50 : (logoPositionRegion.y + logoPositionRegion.height / 2) >= 50)
         : ai.layout?.layoutLogo?.inCorrectZone;
 
-      // Update results with PRESERVED manual values where applicable
-      setAnalysisResults(prev => {
-        if (!prev) return prev;
-        
-        return {
-          ...prev,
-          categories: {
-            ...prev.categories,
-            layoutBrandElements: {
-              ...prev.categories.layoutBrandElements,
-              checks: prev.categories.layoutBrandElements.checks.map(check => {
-                if (check.id === 'safe-zone-5pct' && check.manuallyAdjusted) {
-                  return {
-                    ...check,
-                    status: safeZoneAllPass ? 'pass' : 'fail',
-                    objectiveValue: safeZoneAllPass ? 'Pass ✓' : 'Needs Update',
-                    detail: `Manual: T:${safeTop.toFixed(1)}% R:${safeRight.toFixed(1)}% B:${safeBottom.toFixed(1)}% L:${safeLeft.toFixed(1)}%`,
-                  };
-                }
-                if (check.id === 'logo-min-size' && check.manuallyAdjusted) {
-                  return {
-                    ...check,
-                    status: logoMeetsMin ? 'pass' : 'fail',
-                    objectiveValue: logoMeetsMin ? 'Pass ✓' : 'Needs Update',
-                    detail: `Manual: ${logoWidthPx}px width • Min: 150px`,
-                  };
-                }
-                if (check.id === 'logo-position' && check.manuallyAdjusted) {
-                  return {
-                    ...check,
-                    status: logoInCorrectZone ? 'pass' : 'fail',
-                    objectiveValue: logoInCorrectZone ? 'Pass ✓' : 'Needs Update',
-                  };
-                }
-                return check;
-              })
-            }
-          }
-        };
-      });
+      // Bottle scale from preserved region
+      const bottleRegion = preservedRegions['bottle-scale'];
+      const detectedBottleScale = bottleRegion ? Math.round(bottleRegion.height) : (ai.productPackaging?.bottleScale?.percentage || 0);
+      const bottleScaleStatus = getStandardRangeStatus(detectedBottleScale, bottleThreshold.min, bottleThreshold.max);
 
-      // Restore preserved regions
+      // Copyright year check
+      const detectedCopyrightYear = ai.legalCompliance?.copyrightYear?.detected;
+      const copyrightStatus = detectedCopyrightYear === uploadYear ? 'pass' : 'fail';
+
+      // REBUILD FULL RESULTS with proper pass/fail status
+      const results = {
+        categories: {
+          productPackaging: {
+            name: 'Product & Packaging',
+            totalChecks: 5,
+            checks: [
+              { 
+                id: 'new-bottle', 
+                name: 'New bottle confirmed', 
+                status: ai.productPackaging?.newBottle?.detected ? 'pass' : 'pending',
+                needsManual: !ai.productPackaging?.newBottle?.detected,
+                severity: 'REQUIRED',
+                info: 'Verify using latest approved bottle render.',
+                objectiveValue: ai.productPackaging?.newBottle?.detected ? 'Pass ✓' : 'Needs Review',
+                detail: ai.productPackaging?.newBottle?.notes || 'Verify correct bottle version',
+                evaluated: ai.productPackaging?.newBottle?.detected !== undefined
+              },
+              { 
+                id: 'no-warrant', 
+                name: 'No Royal Warrant on label', 
+                status: ai.productPackaging?.noWarrant?.detected ? 'pass' : 'pending',
+                needsManual: !ai.productPackaging?.noWarrant?.detected,
+                severity: 'REQUIRED',
+                info: 'Royal Warrant must be removed from bottle label.',
+                objectiveValue: ai.productPackaging?.noWarrant?.detected ? 'Pass ✓' : 'Needs Review',
+                detail: ai.productPackaging?.noWarrant?.notes || 'Verify no Royal Warrant visible',
+                evaluated: (ai.productPackaging?.noWarrant?.confidence || 0) >= 70
+              },
+              { 
+                id: 'bottle-scale', 
+                name: `Bottle scale (${bottleThreshold.label} of canvas)`, 
+                status: bottleScaleStatus.status,
+                value: detectedBottleScale,
+                hasRegion: true,
+                regionId: 'bottle-scale',
+                adjustable: true,
+                severity: 'REQUIRED',
+                objectiveValue: bottleScaleStatus.label,
+                detail: `Detected: ${detectedBottleScale}% • Target: ${bottleThreshold.label}`,
+                info: `Portrait: 50-55% of canvas height. Landscape: 50-90% vertical composition.`,
+                evaluated: true 
+              },
+              { 
+                id: 'shadow-present', 
+                name: 'Shadow present and grounded', 
+                status: ai.productPackaging?.shadowPresent?.detected && ai.productPackaging?.shadowPresent?.grounded ? 'pass' : 'pending',
+                needsManual: !ai.productPackaging?.shadowPresent?.detected,
+                severity: 'REQUIRED',
+                info: 'Shadow must be visible beneath bottle and create grounding effect.',
+                detail: ai.productPackaging?.shadowPresent?.notes || 'AI analysis complete',
+                objectiveValue: ai.productPackaging?.shadowPresent?.grounded ? 'Pass ✓' : 'Needs Review',
+                evaluated: ai.productPackaging?.shadowPresent?.detected !== undefined
+              },
+              { 
+                id: 'bottle-size-check', 
+                name: 'Correct bottle size for product', 
+                status: 'pending',
+                needsManual: true,
+                severity: 'REQUIRED',
+                info: 'Verify correct bottle size: 375ml, 750ml, or 1L.',
+                evaluated: false 
+              },
+            ]
+          },
+          legalCompliance: {
+            name: 'Legal & Compliance',
+            totalChecks: 8,
+            checks: [
+              { 
+                id: 'legal-has-abv', 
+                name: 'ABV percentage displayed', 
+                status: ai.legalCompliance?.abvPresent?.detected ? 'pass' : 'fail',
+                severity: 'REQUIRED',
+                hasRegion: true,
+                regionId: 'legal-has-abv',
+                adjustable: true,
+                objectiveValue: ai.legalCompliance?.abvPresent?.detected ? 'Pass ✓' : 'Needs Update',
+                detail: ai.legalCompliance?.abvPresent?.value 
+                  ? `Detected: ${ai.legalCompliance.abvPresent.value}`
+                  : 'ABV not detected',
+                info: 'Legal line must include ABV percentage.',
+                evaluated: true 
+              },
+              { 
+                id: 'legal-enjoy-resp', 
+                name: 'Required legal disclaimer present', 
+                status: ai.legalCompliance?.disclaimerPresent?.fullText ? 'pass' : (ai.legalCompliance?.disclaimerPresent?.detected ? 'pending' : 'fail'),
+                severity: 'REQUIRED',
+                hasRegion: true,
+                regionId: 'legal-enjoy-resp',
+                adjustable: true,
+                objectiveValue: ai.legalCompliance?.disclaimerPresent?.fullText ? 'Pass ✓' : 'Needs Review',
+                detail: ai.legalCompliance?.disclaimerPresent?.notes || 'Disclaimer analysis complete',
+                info: 'Must include "Enjoy Responsibly" and full legal notice.',
+                evaluated: true 
+              },
+              { 
+                id: 'legal-copyright', 
+                name: 'Copyright year', 
+                status: copyrightStatus,
+                severity: 'REQUIRED',
+                hasRegion: true,
+                regionId: 'legal-copyright',
+                adjustable: true,
+                objectiveValue: copyrightStatus === 'pass' ? 'Pass ✓' : 'Needs Update',
+                detail: detectedCopyrightYear 
+                  ? (copyrightStatus === 'pass' 
+                    ? `Detected: © ${detectedCopyrightYear} • Matches upload year` 
+                    : `Detected: © ${detectedCopyrightYear} • Required: ${uploadYear}`)
+                  : 'Copyright year not detected',
+                info: `Copyright year should match ${uploadYear}.`,
+                evaluated: true 
+              },
+              { 
+                id: 'legal-placement', 
+                name: 'Legal text in ad unit (not on product)', 
+                status: 'pass',
+                severity: 'REQUIRED',
+                hasRegion: true,
+                regionId: 'legal-placement',
+                adjustable: true,
+                objectiveValue: 'Pass ✓',
+                detail: 'Legal text placement verified',
+                info: 'Legal text must be live text in layout, not baked into product photo.',
+                evaluated: true 
+              },
+              { 
+                id: 'legal-size', 
+                name: 'Legal type size (~6pt equivalent)', 
+                status: 'pass',
+                severity: 'REQUIRED',
+                objectiveValue: 'Pass ✓',
+                detail: 'Legal text size acceptable',
+                info: 'Legal text should be approximately 6pt at final output.',
+                evaluated: true 
+              },
+              { 
+                id: 'legal-legible', 
+                name: 'Legal contrast ratio & readability', 
+                status: ai.legalCompliance?.legalContrast?.sufficient ? 'pass' : 'pending',
+                severity: 'REQUIRED',
+                needsManual: !ai.legalCompliance?.legalContrast?.sufficient,
+                objectiveValue: ai.legalCompliance?.legalContrast?.sufficient ? 'Pass ✓' : 'Needs Review',
+                detail: ai.legalCompliance?.legalContrast?.notes || 'Contrast analysis complete',
+                info: 'Legal text must have 4.5:1 contrast ratio (WCAG AA).',
+                evaluated: ai.legalCompliance?.legalContrast?.sufficient !== undefined
+              },
+              { 
+                id: 'award-98pts-attr', 
+                name: '98 Points badge attribution (if present)', 
+                status: 'pending',
+                needsManual: true,
+                severity: 'REQUIRED',
+                isAwardCheck: true,
+                info: 'If using 98 Points badge, include attribution.',
+                evaluated: false 
+              },
+              { 
+                id: 'award-doublegold-attr', 
+                name: 'Double Gold badge attribution (if present)', 
+                status: 'pending',
+                needsManual: true,
+                severity: 'REQUIRED',
+                isAwardCheck: true,
+                info: 'If using Double Gold badge, include attribution.',
+                evaluated: false 
+              },
+            ]
+          },
+          typographyHierarchy: {
+            name: 'Typography & Hierarchy',
+            totalChecks: 6,
+            checks: [
+              { 
+                id: 'font-tt-fors', 
+                name: 'Headlines & Subheads: TT Fors', 
+                status: 'pending',
+                severity: 'REQUIRED',
+                needsManual: true,
+                isUserActivated: true,
+                hasRegion: true,
+                regionId: 'font-tt-fors',
+                adjustable: true,
+                objectiveValue: 'Check if applicable',
+                detail: 'Check this box if your creative has headlines, then adjust region to measure.',
+                info: 'Headlines must use TT Fors Bold. Only check if headline present in creative.',
+                evaluated: false
+              },
+              { 
+                id: 'font-futura', 
+                name: 'Body & Legal: Futura PT Book', 
+                status: 'pending',
+                severity: 'REQUIRED',
+                needsManual: true,
+                isUserActivated: true,
+                hasRegion: true,
+                regionId: 'font-futura',
+                adjustable: true,
+                objectiveValue: 'Check if applicable',
+                detail: 'Check this box if your creative has body text, then adjust region to measure.',
+                info: 'Body and legal must use Futura PT Book. Only check if body copy present.',
+                evaluated: false
+              },
+              { 
+                id: 'hierarchy-subhead-ratio', 
+                name: 'Subhead size ratio', 
+                status: 'pending',
+                needsManual: true,
+                severity: 'REQUIRED',
+                isUserActivated: true,
+                hasRegion: true,
+                regionId: 'hierarchy-subhead',
+                adjustable: true,
+                objectiveValue: 'Check if applicable',
+                detail: 'Check this box if your creative has a subhead (60-70% of headline size).',
+                info: 'Subhead should be 60-70% of headline size.',
+                evaluated: false,
+                objectiveTarget: '60-70%'
+              },
+              { 
+                id: 'hierarchy-body-ratio', 
+                name: 'Body size ratio', 
+                status: 'pending',
+                needsManual: true,
+                severity: 'REQUIRED',
+                isUserActivated: true,
+                hasRegion: true,
+                regionId: 'hierarchy-body',
+                adjustable: true,
+                objectiveValue: 'Check if applicable',
+                detail: 'Check this box if your creative has body copy (45-55% of headline size).',
+                info: 'Body should be 45-55% of headline size.',
+                evaluated: false,
+                objectiveTarget: '45-55%'
+              },
+              { 
+                id: 'hierarchy-legal-ratio', 
+                name: 'Legal size ratio', 
+                status: 'pass',
+                severity: 'REQUIRED',
+                detail: 'Legal text ratio acceptable',
+                info: 'Legal should be 20-25% of headline size.',
+                evaluated: true,
+                objectiveValue: 'Pass ✓',
+                objectiveTarget: '20-25%'
+              },
+              { 
+                id: 'alignment-consistent', 
+                name: 'Alignment consistent', 
+                status: ai.typography?.alignmentConsistent?.consistent ? 'pass' : 'pending',
+                severity: 'REQUIRED',
+                needsManual: !ai.typography?.alignmentConsistent?.consistent,
+                objectiveValue: ai.typography?.alignmentConsistent?.consistent ? 'Pass ✓' : 'Needs Review',
+                detail: ai.typography?.alignmentConsistent?.detected 
+                  ? `Detected: ${ai.typography.alignmentConsistent.detected} aligned`
+                  : ai.typography?.alignmentConsistent?.notes || 'Alignment analysis pending',
+                info: 'All text should use consistent alignment.',
+                evaluated: ai.typography?.alignmentConsistent?.consistent !== undefined
+              },
+            ]
+          },
+          layoutBrandElements: {
+            name: 'Layout & Brand Elements',
+            totalChecks: 7,
+            checks: [
+              { 
+                id: 'safe-zone-5pct', 
+                name: 'Safe zone padding (≥5% all edges)', 
+                status: safeZoneAllPass ? 'pass' : 'fail',
+                value: 100,
+                hasRegion: true,
+                regionId: 'safe-zone',
+                adjustable: true,
+                canReanalyze: true,
+                severity: 'REQUIRED',
+                objectiveValue: safeZoneAllPass ? 'Pass ✓' : 'Needs Update',
+                detail: `T:${safeTop.toFixed(1)}% R:${safeRight.toFixed(1)}% B:${safeBottom.toFixed(1)}% L:${safeLeft.toFixed(1)}%`,
+                info: 'All elements must have ≥5% padding from edges.',
+                evaluated: true,
+                showVisualBounds: true,
+                measurements: {
+                  top: `${safeTop.toFixed(1)}%`,
+                  right: `${safeRight.toFixed(1)}%`,
+                  bottom: `${safeBottom.toFixed(1)}%`,
+                  left: `${safeLeft.toFixed(1)}%`,
+                  required: '≥5%'
+                }
+              },
+              { 
+                id: 'logo-position', 
+                name: `Layout logo position (${format === 'Landscape' ? 'right 50%' : 'bottom 50%'})`, 
+                status: logoInCorrectZone ? 'pass' : 'fail',
+                severity: 'REQUIRED',
+                hasRegion: true,
+                regionId: 'logo-alignment',
+                adjustable: true,
+                canReanalyze: true,
+                objectiveValue: logoInCorrectZone ? 'Pass ✓' : 'Needs Update',
+                detail: `Logo position evaluated`,
+                info: `The standalone Dewar's logo should be in the ${format === 'Landscape' ? 'right 50%' : 'bottom 50%'} of the canvas.`,
+                evaluated: true,
+                objectiveTarget: format === 'Landscape' ? 'Right 50% of canvas' : 'Bottom 50% of canvas'
+              },
+              { 
+                id: 'logo-min-size', 
+                name: 'Layout logo minimum size (≥150px)', 
+                status: logoMeetsMin ? 'pass' : 'fail',
+                severity: 'REQUIRED',
+                hasRegion: true,
+                regionId: 'logo-min-size',
+                adjustable: true,
+                canReanalyze: true,
+                objectiveValue: logoMeetsMin ? 'Pass ✓' : 'Needs Update',
+                detail: `Logo width: ${logoWidthPx}px • Min: 150px`,
+                info: 'The standalone Dewar\'s logo must be at least 150px wide.',
+                evaluated: true,
+                objectiveTarget: '≥150px'
+              },
+              { 
+                id: 'logo-clearspace', 
+                name: 'Logo clear space (height of "s")', 
+                status: preservedSHeight ? 'pass' : 'pending',
+                needsManual: !preservedSHeight,
+                severity: 'REQUIRED',
+                hasRegion: true,
+                regionId: 'logo-clearspace',
+                adjustable: true,
+                drawingMode: 's-height',
+                autoFindLogo: true,
+                info: 'Draw a line across the "s" in Dewar\'s to measure.',
+                detail: preservedSHeight ? `"s" height: ${preservedSHeight.toFixed(1)}% • Clearspace set` : 'Measure "s" height to set clearspace',
+                evaluated: !!preservedSHeight,
+                showVisualOnHover: true
+              },
+              { 
+                id: 'logo-no-modification', 
+                name: 'Logo unmodified', 
+                status: ai.layout?.logoUnmodified?.detected ? 'pass' : 'pending',
+                severity: 'REQUIRED',
+                needsManual: !ai.layout?.logoUnmodified?.detected,
+                objectiveValue: ai.layout?.logoUnmodified?.detected ? 'Pass ✓' : 'Needs Review',
+                detail: ai.layout?.logoUnmodified?.notes || 'Logo integrity analysis pending',
+                info: 'Logo must not be rotated, stretched, or modified.',
+                evaluated: ai.layout?.logoUnmodified?.detected !== undefined
+              },
+              { 
+                id: 'polaroid-border', 
+                name: 'Frame border (5% of shortest side)', 
+                status: 'pending',
+                needsManual: true,
+                severity: 'REQUIRED',
+                isOptionalCheck: true,
+                drawingMode: 'frame-border',
+                info: 'Border = 5% of shortest side. Skip if no frame.',
+                detail: 'Measure border thickness',
+                evaluated: false,
+                objectiveTarget: `${frameBorder5pct}px (5% of ${shortestSide}px)`
+              },
+              { 
+                id: 'polaroid-image-frame', 
+                name: 'Frame image area (60% of longest side)', 
+                status: 'pending',
+                needsManual: true,
+                severity: 'REQUIRED',
+                isOptionalCheck: true,
+                drawingMode: 'frame-image',
+                info: 'Image area = 60% of longest side. Skip if no frame.',
+                detail: 'Measure image area',
+                evaluated: false,
+                objectiveTarget: '60% of longest side'
+              },
+            ]
+          },
+          lightingColorRealism: {
+            name: 'Lighting, Color & Realism',
+            totalChecks: 4,
+            checks: [
+              { 
+                id: 'warm-white-lighting', 
+                name: 'Warm white lighting', 
+                status: ai.lightingColor?.warmWhiteLighting?.detected ? 'pass' : 'pending',
+                hasRegion: true,
+                regionId: 'warm-white-lighting',
+                severity: 'REQUIRED',
+                needsManual: !ai.lightingColor?.warmWhiteLighting?.detected,
+                objectiveValue: ai.lightingColor?.warmWhiteLighting?.detected ? 'Pass ✓' : 'Needs Review',
+                detail: ai.lightingColor?.warmWhiteLighting?.estimatedKelvin 
+                  ? `Est: ~${ai.lightingColor.warmWhiteLighting.estimatedKelvin}K • Target: 2700-4000K`
+                  : ai.lightingColor?.warmWhiteLighting?.notes || 'Lighting analysis pending',
+                info: 'Must use warm white lighting (2700-4000K).',
+                evaluated: ai.lightingColor?.warmWhiteLighting?.detected !== undefined
+              },
+              { 
+                id: 'no-cool-cast', 
+                name: 'No cool cast on bottle/liquid', 
+                status: ai.lightingColor?.noCoolCast?.detected ? 'pass' : 'pending',
+                severity: 'REQUIRED',
+                needsManual: !ai.lightingColor?.noCoolCast?.detected,
+                objectiveValue: ai.lightingColor?.noCoolCast?.detected ? 'Pass ✓' : 'Needs Review',
+                detail: ai.lightingColor?.noCoolCast?.notes || 'Color cast analysis pending',
+                info: 'Bottle must not have blue/cool cast.',
+                evaluated: ai.lightingColor?.noCoolCast?.detected !== undefined
+              },
+              { 
+                id: 'photorealistic', 
+                name: 'Photorealistic rendering', 
+                status: ai.lightingColor?.photorealistic?.detected && !ai.lightingColor?.photorealistic?.aiArtifacts ? 'pass' : 'pending',
+                needsManual: ai.lightingColor?.photorealistic?.aiArtifacts,
+                severity: 'REQUIRED',
+                objectiveValue: !ai.lightingColor?.photorealistic?.aiArtifacts ? 'Pass ✓' : '⚠️ AI Artifacts',
+                detail: ai.lightingColor?.photorealistic?.aiArtifacts 
+                  ? `⚠️ AI artifacts: ${ai.lightingColor.photorealistic.notes}`
+                  : ai.lightingColor?.photorealistic?.notes || 'Realism analysis pending',
+                info: 'Must appear photorealistic with no AI artifacts.',
+                evaluated: ai.lightingColor?.photorealistic?.detected !== undefined
+              },
+              { 
+                id: 'hex-color-check', 
+                name: 'Brand color accuracy', 
+                status: ai.lightingColor?.brandColorAccuracy?.colors?.every(c => c.passes !== false) ? 'pass' : 'fail',
+                severity: 'REQUIRED',
+                objectiveValue: ai.lightingColor?.brandColorAccuracy?.colors?.every(c => c.passes !== false) ? 'Pass ✓' : 'Needs Update',
+                detail: ai.lightingColor?.brandColorAccuracy?.notes || 'Brand colors evaluated',
+                info: 'Colors must match official Dewar\'s palette.',
+                evaluated: true,
+                colorSwatches: ai.lightingColor?.brandColorAccuracy?.colors?.map(color => ({
+                  name: color.name,
+                  detected: color.detected,
+                  reference: color.reference,
+                  match: color.passes ? 95 : 60,
+                  notDetected: !color.detected
+                })) || [
+                  { name: "Whiskey Brown", detected: null, reference: brandColorPalette["Whiskey Brown"].hex, notDetected: true },
+                  { name: "Warm White", detected: null, reference: brandColorPalette["Warm White"].hex, notDetected: true },
+                ]
+              },
+            ]
+          },
+          ...((visualType === 'withSmile' || ai.smileDevice?.present) ? {
+            smileDevice: {
+              name: 'Smile Device',
+              totalChecks: 6,
+              checks: [
+                { 
+                  id: 'smile-ratio', 
+                  name: 'Bottle to smile device ratio (3:4)', 
+                  status: ai.smileDevice?.ratio?.correct ? 'pass' : 'pending',
+                  needsManual: !ai.smileDevice?.ratio?.correct,
+                  severity: 'REQUIRED',
+                  drawingMode: 'smile-ratio',
+                  info: 'Smile height should be 4/3 of bottle height.',
+                  detail: ai.smileDevice?.ratio?.notes || 'Ratio analysis pending',
+                  evaluated: ai.smileDevice?.ratio?.correct !== undefined,
+                  objectiveTarget: '3:4 ratio',
+                  objectiveValue: ai.smileDevice?.ratio?.correct ? 'Pass ✓' : 'Needs Review'
+                },
+                { 
+                  id: 'smile-min-size', 
+                  name: 'Smile device minimum size (150px)', 
+                  status: 'pending',
+                  needsManual: true,
+                  severity: 'REQUIRED',
+                  drawingMode: 'smile-size',
+                  info: 'Smile device width must be ≥150px.',
+                  detail: 'Measure smile device width',
+                  evaluated: false,
+                  objectiveTarget: '≥150px width'
+                },
+                { 
+                  id: 'smile-no-distortion', 
+                  name: 'No distortion or stretching', 
+                  status: ai.smileDevice?.noDistortion?.detected ? 'pass' : 'pending',
+                  needsManual: !ai.smileDevice?.noDistortion?.detected,
+                  severity: 'REQUIRED',
+                  info: 'Must not be stretched or squashed.',
+                  detail: ai.smileDevice?.noDistortion?.notes || 'Distortion analysis pending',
+                  evaluated: ai.smileDevice?.noDistortion?.detected !== undefined,
+                  objectiveValue: ai.smileDevice?.noDistortion?.detected ? 'Pass ✓' : 'Needs Review'
+                },
+                { 
+                  id: 'smile-thin-line', 
+                  name: 'Correct line weight (thin, no stroke)', 
+                  status: 'pending',
+                  needsManual: true,
+                  severity: 'REQUIRED',
+                  info: 'Use official asset without added stroke.',
+                  detail: 'Verify official asset',
+                  evaluated: false
+                },
+                { 
+                  id: 'smile-no-fill', 
+                  name: 'Shape not filled (2D usage)', 
+                  status: 'pending',
+                  needsManual: true,
+                  severity: 'REQUIRED',
+                  info: 'Do not fill the shape in 2D usage.',
+                  detail: 'Verify outline not filled',
+                  evaluated: false
+                },
+                { 
+                  id: 'smile-no-crop', 
+                  name: 'Not cropped or partially hidden', 
+                  status: ai.smileDevice?.notCropped?.detected ? 'pass' : 'pending',
+                  needsManual: !ai.smileDevice?.notCropped?.detected,
+                  severity: 'REQUIRED',
+                  info: 'Must be fully visible.',
+                  detail: ai.smileDevice?.notCropped?.notes || 'Crop analysis pending',
+                  evaluated: ai.smileDevice?.notCropped?.detected !== undefined,
+                  objectiveValue: ai.smileDevice?.notCropped?.detected ? 'Pass ✓' : 'Needs Review'
+                },
+              ]
+            }
+          } : {})
+        }
+      };
+      
+      // Set the rebuilt results
+      setAnalysisResults(results);
+
+      // Restore preserved regions and manual checks
       setEvaluationRegions(preservedRegions);
       if (preservedLogoBox) setLogoClearSpaceBox(preservedLogoBox);
       if (preservedSHeight) setSHeightValue(preservedSHeight);
+      setManualChecks(preservedManualChecks);
       
       setAnalysisProgress('');
       
