@@ -65,7 +65,7 @@ const QCAnalyzer = () => {
         return group;
       }
     }
-    return [regionId]; // Return just itself if not in a group
+    return [regionId];
   };
 
   // Severity colors - REQUIRED items must be resolved to proceed
@@ -190,7 +190,7 @@ const QCAnalyzer = () => {
     let weightedScore = 0;
     let totalWeight = 0;
     
-    const severityWeight = { REQUIRED: 1 };
+    const severityWeight = { REQUIRED: 3 };
     const awardCheckIds = ['award-98pts-attr', 'award-doublegold-attr', 'claim-highest-rated'];
     
     Object.values(analysisResults.categories).forEach(category => {
@@ -199,6 +199,8 @@ const QCAnalyzer = () => {
         if (awardCheckIds.includes(check.id)) return;
         if (check.isOptionalCheck) return;
         if (check.isAwardCheck) return;
+        // Skip user-activated checks unless the user has checked them
+        if (check.isUserActivated && !manualChecks[check.id]) return;
         
         const weight = severityWeight[check.severity] || 1;
         totalWeight += weight;
@@ -223,6 +225,8 @@ const QCAnalyzer = () => {
         if (awardCheckIds.includes(check.id)) return;
         if (check.isOptionalCheck) return;
         if (check.isAwardCheck) return;
+        // Skip user-activated checks unless the user has checked them
+        if (check.isUserActivated && !manualChecks[check.id]) return;
         if (check.severity === 'REQUIRED' && check.status !== 'pass' && !manualChecks[check.id]) {
           count++;
         }
@@ -281,17 +285,6 @@ const QCAnalyzer = () => {
     });
   };
 
-  // Sync linked regions when one is moved/resized
-  const syncLinkedRegions = (primaryRegionId, newRegionData) => {
-    const linkedRegions = getLinkedRegions(primaryRegionId);
-    
-    const updates = {};
-    linkedRegions.forEach(regionId => {
-      updates[regionId] = { ...evaluationRegions[regionId], ...newRegionData };
-    });
-    return updates;
-  };
-
   // Handle mouse move for drag/resize
   const handleMouseMove = (e) => {
     const container = imageContainerRef.current;
@@ -324,7 +317,11 @@ const QCAnalyzer = () => {
       const newY = Math.max(0, Math.min(100 - evaluationRegions[draggingRegion].height, dragStart.regionY + deltaY));
       
       // Sync all linked regions
-      const updates = syncLinkedRegions(draggingRegion, { x: newX, y: newY });
+      const linkedRegions = getLinkedRegions(draggingRegion);
+      const updates = {};
+      linkedRegions.forEach(regionId => {
+        updates[regionId] = { ...evaluationRegions[regionId], x: newX, y: newY };
+      });
       
       setEvaluationRegions(prev => ({
         ...prev,
@@ -340,7 +337,11 @@ const QCAnalyzer = () => {
       const newHeight = Math.max(10, Math.min(100 - evaluationRegions[resizingRegion].y, dragStart.regionHeight + deltaY));
       
       // Sync all linked regions
-      const updates = syncLinkedRegions(resizingRegion, { width: newWidth, height: newHeight });
+      const linkedRegions = getLinkedRegions(resizingRegion);
+      const updates = {};
+      linkedRegions.forEach(regionId => {
+        updates[regionId] = { ...evaluationRegions[regionId], width: newWidth, height: newHeight };
+      });
       
       setEvaluationRegions(prev => ({
         ...prev,
@@ -401,7 +402,6 @@ const QCAnalyzer = () => {
         }
         if (linkedRegionId === 'logo-alignment') {
           const alignRegion = evaluationRegions[linkedRegionId];
-          const isLandscape = detectedFormat === "Landscape";
           updateCheck("layoutBrandElements", "logo-position", { 
             status: 'pending',
             objectiveValue: 'Adjusted - re-run AI',
@@ -459,16 +459,45 @@ const QCAnalyzer = () => {
         });
         checkNeedsReanalysis("safe-zone-5pct");
         break;
+      case "logo-alignment":
+        const alignRegion = evaluationRegions[regionId];
+        const isLandscape = detectedFormat === "Landscape";
+        const inCorrectZone = isLandscape 
+          ? (alignRegion.x + alignRegion.width / 2) >= 50 
+          : (alignRegion.y + alignRegion.height / 2) >= 50;
+        updateCheck("layoutBrandElements", "logo-position", { 
+          status: 'pending',
+          objectiveValue: 'Adjusted - re-run AI',
+          detail: `Manual: Logo at ${alignRegion.x.toFixed(1)}%, ${alignRegion.y.toFixed(1)}% • Click re-run to verify`,
+          manuallyAdjusted: true
+        });
+        checkNeedsReanalysis("logo-position");
+        break;
+      case "logo-min-size":
+        const sizeRegion = evaluationRegions[regionId];
+        const logoWidthPx = imageData ? Math.round((sizeRegion.width / 100) * imageData.width) : 0;
+        const meetsMinimum = logoWidthPx >= 150;
+        updateCheck("layoutBrandElements", "logo-min-size", { 
+          status: 'pending',
+          objectiveValue: 'Adjusted - re-run AI',
+          detail: `Manual: ${logoWidthPx}px width • Minimum: 150px • Click re-run to verify`,
+          manuallyAdjusted: true
+        });
+        checkNeedsReanalysis("logo-min-size");
+        break;
       case "logo-clearspace":
         updateCheck("layoutBrandElements", "logo-clearspace", { status: 'pending', objectiveValue: 'Adjusted - re-run AI', manuallyAdjusted: true });
         checkNeedsReanalysis("logo-clearspace");
         break;
       case "legal-has-abv":
+      case "legal-enjoy-resp":
       case "legal-copyright":
+      case "legal-placement":
         updateCheck("legalCompliance", regionId, { status: 'pending', objectiveValue: 'Adjusted - re-run AI', manuallyAdjusted: true });
         checkNeedsReanalysis(regionId);
         break;
       case "font-tt-fors":
+      case "font-futura":
         updateCheck("typographyHierarchy", regionId, { status: 'pending', objectiveValue: 'Adjusted - re-run AI', manuallyAdjusted: true });
         checkNeedsReanalysis(regionId);
         break;
@@ -1300,72 +1329,62 @@ const QCAnalyzer = () => {
             checks: [
               { 
                 id: 'font-tt-fors', 
-                name: 'Headlines & Subheads: TT Fors (if applicable)', 
-                status: ai.typography?.headlineFont?.isTTFors ? 'pass' : (ai.typography?.headlineFont?.detected ? 'pending' : 'pass'),
+                name: 'Headlines & Subheads: TT Fors', 
+                status: 'pending',
                 severity: 'REQUIRED',
-                isOptionalCheck: true,
+                needsManual: true,
+                isUserActivated: true,
                 hasRegion: true,
                 regionId: 'font-tt-fors',
                 adjustable: true,
-                needsManual: ai.typography?.headlineFont?.detected && !ai.typography?.headlineFont?.isTTFors,
-                objectiveValue: ai.typography?.headlineFont?.isTTFors 
-                  ? 'Pass ✓'
-                  : (ai.typography?.headlineFont?.detected ? 'Needs Review' : 'N/A - No headline detected'),
-                detail: ai.typography?.headlineFont?.detected 
-                  ? `AI Detected: ${ai.typography.headlineFont.detected} (${ai.typography.headlineFont.confidence}% confidence)`
-                  : 'No headline text detected - skip if not applicable',
-                info: 'Headlines must use TT Fors Bold. Skip if no headline in creative.',
-                evaluated: true,
-                subItems: ai.typography?.headlineFont?.isTTFors ? [
-                  { label: 'Font match', value: 'TT Fors', status: 'pass' },
-                  { label: 'Confidence', value: `${ai.typography?.headlineFont?.confidence}%`, status: 'pass' },
-                ] : undefined
+                objectiveValue: 'Check if applicable',
+                detail: 'Check this box if your creative has headlines, then adjust region to measure.',
+                info: 'Headlines must use TT Fors Bold. Only check if headline present in creative.',
+                evaluated: false
               },
               { 
                 id: 'font-futura', 
-                name: 'Body & Legal: Futura PT Book (if applicable)', 
-                status: ai.typography?.bodyFont?.isFuturaPT ? 'pass' : (ai.typography?.bodyFont?.detected ? 'pending' : 'pass'),
+                name: 'Body & Legal: Futura PT Book', 
+                status: 'pending',
                 severity: 'REQUIRED',
-                isOptionalCheck: true,
+                needsManual: true,
+                isUserActivated: true,
                 hasRegion: true,
                 regionId: 'font-futura',
                 adjustable: true,
-                needsManual: ai.typography?.bodyFont?.detected && !ai.typography?.bodyFont?.isFuturaPT,
-                objectiveValue: ai.typography?.bodyFont?.isFuturaPT 
-                  ? 'Pass ✓'
-                  : (ai.typography?.bodyFont?.detected ? 'Needs Review' : 'N/A - No body text detected'),
-                detail: ai.typography?.bodyFont?.detected 
-                  ? `AI Detected: ${ai.typography.bodyFont.detected} (${ai.typography.bodyFont.confidence}% confidence)`
-                  : 'No body text detected - skip if not applicable',
-                info: 'Body and legal must use Futura PT Book. Skip if no body copy in creative.',
-                evaluated: true,
+                objectiveValue: 'Check if applicable',
+                detail: 'Check this box if your creative has body text, then adjust region to measure.',
+                info: 'Body and legal must use Futura PT Book. Only check if body copy present.',
+                evaluated: false
               },
               { 
                 id: 'hierarchy-subhead-ratio', 
-                name: 'Subhead size ratio (if applicable)', 
+                name: 'Subhead size ratio', 
                 status: 'pending',
                 needsManual: true,
                 severity: 'REQUIRED',
-                isOptionalCheck: true,
+                isUserActivated: true,
                 hasRegion: true,
                 regionId: 'hierarchy-subhead',
                 adjustable: true,
-                detail: 'Check if subhead is 60-70% of headline size.',
+                objectiveValue: 'Check if applicable',
+                detail: 'Check this box if your creative has a subhead (60-70% of headline size).',
                 info: 'Subhead should be 60-70% of headline size.',
                 evaluated: false,
                 objectiveTarget: '60-70%'
               },
               { 
                 id: 'hierarchy-body-ratio', 
-                name: 'Body size ratio (if applicable)', 
+                name: 'Body size ratio', 
                 status: 'pending',
                 needsManual: true,
                 severity: 'REQUIRED',
-                isOptionalCheck: true,
+                isUserActivated: true,
                 hasRegion: true,
                 regionId: 'hierarchy-body',
                 adjustable: true,
-                detail: 'Check if body is 45-55% of headline size.',
+                objectiveValue: 'Check if applicable',
+                detail: 'Check this box if your creative has body copy (45-55% of headline size).',
                 info: 'Body should be 45-55% of headline size.',
                 evaluated: false,
                 objectiveTarget: '45-55%'
@@ -1707,11 +1726,14 @@ const QCAnalyzer = () => {
   };
 
   // Severity icon helper - only show when NOT passed
-  const SeverityIcon = ({ severity, isAwardCheck, isPassed }) => {
+  const SeverityIcon = ({ severity, isAwardCheck, isPassed, isUserActivated }) => {
     if (isPassed) return null;
     
     if (isAwardCheck) {
       return <Info size={12} color="#6b7280" style={{ marginRight: 6 }} />;
+    }
+    if (isUserActivated) {
+      return <Info size={12} color="#f59e0b" style={{ marginRight: 6 }} />;
     }
     if (severity === 'REQUIRED') {
       return <AlertOctagon size={12} color={severityColors.REQUIRED} style={{ marginRight: 6 }} />;
@@ -3185,19 +3207,20 @@ const QCAnalyzer = () => {
                                   severity={check.severity} 
                                   isAwardCheck={check.isAwardCheck} 
                                   isPassed={isPassed}
+                                  isUserActivated={check.isUserActivated}
                                 />
                                 <span style={{ marginRight: '8px' }}>{check.name}</span>
                                 {check.objectiveValue && (
                                   <span style={{ 
                                     ...styles.checkValue, 
-                                    backgroundColor: isPassed ? 'rgba(16, 185, 129, 0.2)' : 'rgba(239, 68, 68, 0.2)',
-                                    color: isPassed ? '#10b981' : '#ef4444',
+                                    backgroundColor: isPassed ? 'rgba(16, 185, 129, 0.2)' : (check.isUserActivated && !manualChecks[check.id] ? 'rgba(107, 114, 128, 0.2)' : 'rgba(239, 68, 68, 0.2)'),
+                                    color: isPassed ? '#10b981' : (check.isUserActivated && !manualChecks[check.id] ? '#6b7280' : '#ef4444'),
                                   }}>
                                     {check.objectiveValue}
                                   </span>
                                 )}
-                                {/* Only show severity tag if NOT passed, not an award check, and not an optional check */}
-                                {check.severity === 'REQUIRED' && !check.isAwardCheck && !check.isOptionalCheck && !isPassed && (
+                                {/* Only show severity tag if NOT passed, not an award check, not user-activated */}
+                                {check.severity && !check.isAwardCheck && !check.isUserActivated && !isPassed && (
                                   <span style={{
                                     ...styles.severityTag,
                                     backgroundColor: 'rgba(239, 68, 68, 0.15)',
@@ -3215,13 +3238,13 @@ const QCAnalyzer = () => {
                                     IF PRESENT
                                   </span>
                                 )}
-                                {check.isOptionalCheck && !isPassed && (
+                                {check.isUserActivated && !manualChecks[check.id] && (
                                   <span style={{
                                     ...styles.severityTag,
-                                    backgroundColor: 'rgba(107, 114, 128, 0.15)',
-                                    color: '#6b7280',
+                                    backgroundColor: 'rgba(245, 158, 11, 0.15)',
+                                    color: '#f59e0b',
                                   }}>
-                                    IF APPLICABLE
+                                    ONLY CHECK IF APPLICABLE
                                   </span>
                                 )}
                                 {check.info && (
@@ -3243,6 +3266,8 @@ const QCAnalyzer = () => {
                                     e.stopPropagation();
                                     e.preventDefault();
                                     setDrawingMode(check.drawingMode);
+                                    setDrawStart(null);
+                                    setDrawnMeasurement(null);
                                     setActiveRegion(null);
                                   }}
                                   style={{
