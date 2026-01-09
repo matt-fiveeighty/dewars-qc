@@ -52,10 +52,25 @@ const QCAnalyzer = () => {
   const fileInputRef = useRef(null);
   const imageContainerRef = useRef(null);
 
+  // Linked region groups - when one is adjusted, all in the group update together
+  const linkedRegionGroups = {
+    legalGroup: ['legal-enjoy-resp', 'legal-placement', 'font-futura'],
+    logoGroup: ['logo-alignment', 'logo-min-size']
+  };
+
+  // Get all regions in the same group as the given region
+  const getLinkedRegions = (regionId) => {
+    for (const group of Object.values(linkedRegionGroups)) {
+      if (group.includes(regionId)) {
+        return group;
+      }
+    }
+    return [regionId]; // Return just itself if not in a group
+  };
+
   // Severity colors - REQUIRED items must be resolved to proceed
   const severityColors = {
-    REQUIRED: '#ef4444',
-    MINOR: '#6b7280'
+    REQUIRED: '#ef4444'
   };
 
   // Category colors - 6 categories (smile device only shows when selected)
@@ -175,7 +190,7 @@ const QCAnalyzer = () => {
     let weightedScore = 0;
     let totalWeight = 0;
     
-    const severityWeight = { REQUIRED: 3, MINOR: 1 };
+    const severityWeight = { REQUIRED: 1 };
     const awardCheckIds = ['award-98pts-attr', 'award-doublegold-attr', 'claim-highest-rated'];
     
     Object.values(analysisResults.categories).forEach(category => {
@@ -266,6 +281,17 @@ const QCAnalyzer = () => {
     });
   };
 
+  // Sync linked regions when one is moved/resized
+  const syncLinkedRegions = (primaryRegionId, newRegionData) => {
+    const linkedRegions = getLinkedRegions(primaryRegionId);
+    
+    const updates = {};
+    linkedRegions.forEach(regionId => {
+      updates[regionId] = { ...evaluationRegions[regionId], ...newRegionData };
+    });
+    return updates;
+  };
+
   // Handle mouse move for drag/resize
   const handleMouseMove = (e) => {
     const container = imageContainerRef.current;
@@ -294,13 +320,15 @@ const QCAnalyzer = () => {
       const deltaX = currentX - dragStart.x;
       const deltaY = currentY - dragStart.y;
       
+      const newX = Math.max(0, Math.min(100 - evaluationRegions[draggingRegion].width, dragStart.regionX + deltaX));
+      const newY = Math.max(0, Math.min(100 - evaluationRegions[draggingRegion].height, dragStart.regionY + deltaY));
+      
+      // Sync all linked regions
+      const updates = syncLinkedRegions(draggingRegion, { x: newX, y: newY });
+      
       setEvaluationRegions(prev => ({
         ...prev,
-        [draggingRegion]: {
-          ...prev[draggingRegion],
-          x: Math.max(0, Math.min(100 - prev[draggingRegion].width, dragStart.regionX + deltaX)),
-          y: Math.max(0, Math.min(100 - prev[draggingRegion].height, dragStart.regionY + deltaY)),
-        }
+        ...updates
       }));
     }
     
@@ -308,13 +336,15 @@ const QCAnalyzer = () => {
       const deltaX = currentX - dragStart.x;
       const deltaY = currentY - dragStart.y;
       
+      const newWidth = Math.max(10, Math.min(100 - evaluationRegions[resizingRegion].x, dragStart.regionWidth + deltaX));
+      const newHeight = Math.max(10, Math.min(100 - evaluationRegions[resizingRegion].y, dragStart.regionHeight + deltaY));
+      
+      // Sync all linked regions
+      const updates = syncLinkedRegions(resizingRegion, { width: newWidth, height: newHeight });
+      
       setEvaluationRegions(prev => ({
         ...prev,
-        [resizingRegion]: {
-          ...prev[resizingRegion],
-          width: Math.max(10, Math.min(100 - prev[resizingRegion].x, dragStart.regionWidth + deltaX)),
-          height: Math.max(10, Math.min(100 - prev[resizingRegion].y, dragStart.regionHeight + deltaY)),
-        }
+        ...updates
       }));
     }
   };
@@ -349,6 +379,51 @@ const QCAnalyzer = () => {
         return prev;
       });
     };
+
+    // Handle linked region groups - update all linked checks
+    const linkedRegions = getLinkedRegions(regionId);
+    const isInLinkedGroup = linkedRegions.length > 1;
+    
+    if (isInLinkedGroup) {
+      // Update all linked checks in the group
+      linkedRegions.forEach(linkedRegionId => {
+        if (linkedRegionId === 'legal-enjoy-resp') {
+          updateCheck("legalCompliance", "legal-enjoy-resp", { status: 'pending', objectiveValue: 'Adjusted - re-run AI', manuallyAdjusted: true });
+          checkNeedsReanalysis("legal-enjoy-resp");
+        }
+        if (linkedRegionId === 'legal-placement') {
+          updateCheck("legalCompliance", "legal-placement", { status: 'pending', objectiveValue: 'Adjusted - re-run AI', manuallyAdjusted: true });
+          checkNeedsReanalysis("legal-placement");
+        }
+        if (linkedRegionId === 'font-futura') {
+          updateCheck("typographyHierarchy", "font-futura", { status: 'pending', objectiveValue: 'Adjusted - re-run AI', manuallyAdjusted: true });
+          checkNeedsReanalysis("font-futura");
+        }
+        if (linkedRegionId === 'logo-alignment') {
+          const alignRegion = evaluationRegions[linkedRegionId];
+          const isLandscape = detectedFormat === "Landscape";
+          updateCheck("layoutBrandElements", "logo-position", { 
+            status: 'pending',
+            objectiveValue: 'Adjusted - re-run AI',
+            detail: `Manual: Logo at ${alignRegion.x.toFixed(1)}%, ${alignRegion.y.toFixed(1)}% • Click re-run to verify`,
+            manuallyAdjusted: true
+          });
+          checkNeedsReanalysis("logo-position");
+        }
+        if (linkedRegionId === 'logo-min-size') {
+          const sizeRegion = evaluationRegions[linkedRegionId];
+          const logoWidthPx = imageData ? Math.round((sizeRegion.width / 100) * imageData.width) : 0;
+          updateCheck("layoutBrandElements", "logo-min-size", { 
+            status: 'pending',
+            objectiveValue: 'Adjusted - re-run AI',
+            detail: `Manual: ${logoWidthPx}px width • Minimum: 150px • Click re-run to verify`,
+            manuallyAdjusted: true
+          });
+          checkNeedsReanalysis("logo-min-size");
+        }
+      });
+      return; // Don't process individually if part of a linked group
+    }
     
     switch(regionId) {
       case "bottle-scale":
@@ -384,45 +459,16 @@ const QCAnalyzer = () => {
         });
         checkNeedsReanalysis("safe-zone-5pct");
         break;
-      case "logo-alignment":
-        const alignRegion = evaluationRegions[regionId];
-        const isLandscape = detectedFormat === "Landscape";
-        const inCorrectZone = isLandscape 
-          ? (alignRegion.x + alignRegion.width / 2) >= 50 
-          : (alignRegion.y + alignRegion.height / 2) >= 50;
-        updateCheck("layoutBrandElements", "logo-position", { 
-          status: 'pending',
-          objectiveValue: 'Adjusted - re-run AI',
-          detail: `Manual: Logo at ${alignRegion.x.toFixed(1)}%, ${alignRegion.y.toFixed(1)}% • Click re-run to verify`,
-          manuallyAdjusted: true
-        });
-        checkNeedsReanalysis("logo-position");
-        break;
-      case "logo-min-size":
-        const sizeRegion = evaluationRegions[regionId];
-        const logoWidthPx = imageData ? Math.round((sizeRegion.width / 100) * imageData.width) : 0;
-        const meetsMinimum = logoWidthPx >= 150;
-        updateCheck("layoutBrandElements", "logo-min-size", { 
-          status: 'pending',
-          objectiveValue: 'Adjusted - re-run AI',
-          detail: `Manual: ${logoWidthPx}px width • Minimum: 150px • Click re-run to verify`,
-          manuallyAdjusted: true
-        });
-        checkNeedsReanalysis("logo-min-size");
-        break;
       case "logo-clearspace":
         updateCheck("layoutBrandElements", "logo-clearspace", { status: 'pending', objectiveValue: 'Adjusted - re-run AI', manuallyAdjusted: true });
         checkNeedsReanalysis("logo-clearspace");
         break;
       case "legal-has-abv":
-      case "legal-enjoy-resp":
       case "legal-copyright":
-      case "legal-placement":
         updateCheck("legalCompliance", regionId, { status: 'pending', objectiveValue: 'Adjusted - re-run AI', manuallyAdjusted: true });
         checkNeedsReanalysis(regionId);
         break;
       case "font-tt-fors":
-      case "font-futura":
         updateCheck("typographyHierarchy", regionId, { status: 'pending', objectiveValue: 'Adjusted - re-run AI', manuallyAdjusted: true });
         checkNeedsReanalysis(regionId);
         break;
@@ -1227,7 +1273,7 @@ const QCAnalyzer = () => {
                 name: '98 Points badge attribution (if present)', 
                 status: 'pending',
                 needsManual: true,
-                severity: 'MINOR',
+                severity: 'REQUIRED',
                 isAwardCheck: true,
                 info: 'If using 98 Points badge, include attribution.',
                 evaluated: false 
@@ -1237,7 +1283,7 @@ const QCAnalyzer = () => {
                 name: 'Double Gold badge attribution (if present)', 
                 status: 'pending',
                 needsManual: true,
-                severity: 'MINOR',
+                severity: 'REQUIRED',
                 isAwardCheck: true,
                 info: 'If using Double Gold badge, include attribution.',
                 evaluated: false 
@@ -1256,7 +1302,7 @@ const QCAnalyzer = () => {
                 id: 'font-tt-fors', 
                 name: 'Headlines & Subheads: TT Fors (if applicable)', 
                 status: ai.typography?.headlineFont?.isTTFors ? 'pass' : (ai.typography?.headlineFont?.detected ? 'pending' : 'pass'),
-                severity: 'MINOR',
+                severity: 'REQUIRED',
                 isOptionalCheck: true,
                 hasRegion: true,
                 regionId: 'font-tt-fors',
@@ -1279,7 +1325,7 @@ const QCAnalyzer = () => {
                 id: 'font-futura', 
                 name: 'Body & Legal: Futura PT Book (if applicable)', 
                 status: ai.typography?.bodyFont?.isFuturaPT ? 'pass' : (ai.typography?.bodyFont?.detected ? 'pending' : 'pass'),
-                severity: 'MINOR',
+                severity: 'REQUIRED',
                 isOptionalCheck: true,
                 hasRegion: true,
                 regionId: 'font-futura',
@@ -1299,7 +1345,7 @@ const QCAnalyzer = () => {
                 name: 'Subhead size ratio (if applicable)', 
                 status: 'pending',
                 needsManual: true,
-                severity: 'MINOR',
+                severity: 'REQUIRED',
                 isOptionalCheck: true,
                 hasRegion: true,
                 regionId: 'hierarchy-subhead',
@@ -1314,7 +1360,7 @@ const QCAnalyzer = () => {
                 name: 'Body size ratio (if applicable)', 
                 status: 'pending',
                 needsManual: true,
-                severity: 'MINOR',
+                severity: 'REQUIRED',
                 isOptionalCheck: true,
                 hasRegion: true,
                 regionId: 'hierarchy-body',
@@ -1339,7 +1385,7 @@ const QCAnalyzer = () => {
                 id: 'alignment-consistent', 
                 name: 'Alignment consistent', 
                 status: ai.typography?.alignmentConsistent?.consistent ? 'pass' : 'pending',
-                severity: 'MINOR',
+                severity: 'REQUIRED',
                 needsManual: !ai.typography?.alignmentConsistent?.consistent,
                 objectiveValue: ai.typography?.alignmentConsistent?.consistent ? 'Pass ✓' : 'Needs Review',
                 detail: ai.typography?.alignmentConsistent?.detected 
@@ -1451,7 +1497,7 @@ const QCAnalyzer = () => {
                 name: 'Frame border (5% of shortest side)', 
                 status: 'pending',
                 needsManual: true,
-                severity: 'MINOR',
+                severity: 'REQUIRED',
                 isOptionalCheck: true,
                 drawingMode: 'frame-border',
                 info: 'Border = 5% of shortest side. Skip if no frame.',
@@ -1464,7 +1510,7 @@ const QCAnalyzer = () => {
                 name: 'Frame image area (60% of longest side)', 
                 status: 'pending',
                 needsManual: true,
-                severity: 'MINOR',
+                severity: 'REQUIRED',
                 isOptionalCheck: true,
                 drawingMode: 'frame-image',
                 info: 'Image area = 60% of longest side. Skip if no frame.',
@@ -3150,15 +3196,14 @@ const QCAnalyzer = () => {
                                     {check.objectiveValue}
                                   </span>
                                 )}
-                                {/* Only show severity tag if NOT passed and not an award check */}
-                                {check.severity && !check.isAwardCheck && !isPassed && (
+                                {/* Only show severity tag if NOT passed, not an award check, and not an optional check */}
+                                {check.severity === 'REQUIRED' && !check.isAwardCheck && !check.isOptionalCheck && !isPassed && (
                                   <span style={{
                                     ...styles.severityTag,
-                                    backgroundColor: check.severity === 'BLOCKER' ? 'rgba(239, 68, 68, 0.15)' :
-                                                     check.severity === 'MAJOR' ? 'rgba(245, 158, 11, 0.15)' : 'rgba(107, 114, 128, 0.15)',
-                                    color: severityColors[check.severity],
+                                    backgroundColor: 'rgba(239, 68, 68, 0.15)',
+                                    color: severityColors.REQUIRED,
                                   }}>
-                                    {check.severity}
+                                    REQUIRED
                                   </span>
                                 )}
                                 {check.isAwardCheck && (
@@ -3168,6 +3213,15 @@ const QCAnalyzer = () => {
                                     color: '#6b7280',
                                   }}>
                                     IF PRESENT
+                                  </span>
+                                )}
+                                {check.isOptionalCheck && !isPassed && (
+                                  <span style={{
+                                    ...styles.severityTag,
+                                    backgroundColor: 'rgba(107, 114, 128, 0.15)',
+                                    color: '#6b7280',
+                                  }}>
+                                    IF APPLICABLE
                                   </span>
                                 )}
                                 {check.info && (
